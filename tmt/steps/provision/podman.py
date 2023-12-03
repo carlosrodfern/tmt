@@ -453,6 +453,7 @@ class ProvisionPodman(tmt.steps.provision.ProvisionPlugin[ProvisionPodmanData]):
             name=self.name,
             parent=self.step)
         self._guest.start()
+        self._guest.setup()
 
     def guest(self) -> Optional[GuestContainer]:
         """ Return the provisioned guest """
