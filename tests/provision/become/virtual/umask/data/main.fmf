@@ -1,0 +1,16 @@
+summary: Basic smoke test
+provision:
+    how: virtual
+    image: fedora
+    user: fedora
+    become: true
+discover:
+    tests:
+      - name: Beakerlib test to generate report files on guest
+        test: ./test.sh
+        framework: beakerlib
+execute:
+    how: tmt
+prepare:
+    how: shell
+    script: "echo 'umask 0027' >> /etc/profile; echo 'umask 0027' >> /etc/bashrc"

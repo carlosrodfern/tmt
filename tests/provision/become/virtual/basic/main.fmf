@@ -1,0 +1,2 @@
+summary: Check that become works on virtual provision
+description: Ensures that become works when used in virtual instances.

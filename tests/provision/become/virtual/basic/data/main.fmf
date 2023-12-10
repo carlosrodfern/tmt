@@ -1,0 +1,7 @@
+provision:
+    how: virtual
+    image: fedora
+    user: fedora
+
+execute:
+    how: tmt
