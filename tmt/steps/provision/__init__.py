@@ -1,17 +1,15 @@
 import ast
+import collections
 import dataclasses
 import datetime
 import enum
-import functools
-import hashlib
 import os
+import random
 import re
-import secrets
 import shlex
-import signal as _signal
 import string
 import subprocess
-import threading
+import tempfile
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from shlex import quote
@@ -19,7 +17,6 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
-    Literal,
     Optional,
     TypeVar,
     Union,
@@ -35,24 +32,21 @@ from click import echo
 import tmt
 import tmt.hardware
 import tmt.log
-import tmt.package_managers
 import tmt.plugins
 import tmt.queue
 import tmt.steps
-import tmt.steps.provision
 import tmt.utils
 from tmt.log import Logger
 from tmt.options import option
-from tmt.package_managers import FileSystemPath, Package, PackageManagerClass
 from tmt.plugins import PluginRegistry
 from tmt.steps import Action, ActionTask, PhaseQueue
 from tmt.utils import (
     Command,
     OnProcessStartCallback,
     Path,
-    ProvisionError,
     SerializableContainer,
     ShellScript,
+    cached_property,
     configure_constant,
     effective_workdir_root,
     field,
@@ -78,171 +72,6 @@ REBOOT_TIMEOUT: int = configure_constant(DEFAULT_REBOOT_TIMEOUT, 'TMT_REBOOT_TIM
 RECONNECT_WAIT_TICK = 5
 RECONNECT_WAIT_TICK_INCREASE = 1.0
 
-
-def configure_ssh_options() -> tmt.utils.RawCommand:
-    """ Extract custom SSH options from environment variables """
-
-    options: tmt.utils.RawCommand = []
-
-    for name, value in os.environ.items():
-        match = re.match(r'TMT_SSH_([a-zA-Z_]+)', name)
-
-        if not match:
-            continue
-
-        options.append(f'-o{match.group(1).title().replace("_", "")}={value}')
-
-    return options
-
-
-#: Default SSH options.
-#: This is the default set of SSH options tmt would use for all SSH connections.
-DEFAULT_SSH_OPTIONS: tmt.utils.RawCommand = [
-    '-oForwardX11=no',
-    '-oStrictHostKeyChecking=no',
-    '-oUserKnownHostsFile=/dev/null',
-
-    # Try establishing connection multiple times before giving up.
-    '-oConnectionAttempts=5',
-    '-oConnectTimeout=60',
-
-    # Prevent ssh from disconnecting if no data has been
-    # received from the server for a long time (#868).
-    '-oServerAliveInterval=5',
-    '-oServerAliveCountMax=60'
-    ]
-
-#: Base SSH options.
-#: This is the base set of SSH options tmt would use for all SSH
-#: connections. It is a combination of the default SSH options and those
-#: provided by environment variables.
-BASE_SSH_OPTIONS: tmt.utils.RawCommand = DEFAULT_SSH_OPTIONS + configure_ssh_options()
-
-#: SSH master socket path is limited to this many characters.
-#:
-#: * UNIX socket path is limited to either 108 or 104 characters, depending
-#:   on the platform. See `man 7 unix` and/or kernel sources, for example.
-#: * SSH client processes may create paths with added "connection hash"
-#:   when connecting to the master, that is a couple of characters we need
-#:   space for.
-#:
-SSH_MASTER_SOCKET_LENGTH_LIMIT = 104 - 20
-
-#: A minimal number of characters of guest ID hash used by
-#: :py:func:`_socket_path_hash` when looking for a free SSH socket
-#: filename.
-SSH_MASTER_SOCKET_MIN_HASH_LENGTH = 4
-
-#: A maximal number of characters of guest ID hash used by
-#: :py:func:`_socket_path_hash` when looking for a free SSH socket
-#: filename.
-SSH_MASTER_SOCKET_MAX_HASH_LENGTH = 64
-
-
-@overload
-def _socket_path_trivial(
-        *,
-        socket_dir: Path,
-        guest_id: str,
-        limit_size: Literal[True] = True,
-        logger: tmt.log.Logger) -> Optional[Path]:
-    pass
-
-
-@overload
-def _socket_path_trivial(
-        *,
-        socket_dir: Path,
-        guest_id: str,
-        limit_size: Literal[False] = False,
-        logger: tmt.log.Logger) -> Path:
-    pass
-
-
-def _socket_path_trivial(
-        *,
-        socket_dir: Path,
-        guest_id: str,
-        limit_size: bool = True,
-        logger: tmt.log.Logger) -> Optional[Path]:
-    """ Generate SSH socket path using guest IDs """
-
-    socket_path = socket_dir / f'{guest_id}.socket'
-
-    logger.debug(
-        f"Possible SSH master socket path '{socket_path}' (trivial method).",
-        level=4)
-
-    if not limit_size:
-        return socket_path
-
-    return socket_path if len(str(socket_path)) < SSH_MASTER_SOCKET_LENGTH_LIMIT else None
-
-
-def _socket_path_hash(
-        *,
-        socket_dir: Path,
-        guest_id: str,
-        limit_size: bool = True,
-        logger: tmt.log.Logger) -> Optional[Path]:
-    """
-    Generate SSH socket path using a hash of guest IDs.
-
-    Generates less readable, but hopefully shorter and therefore
-    acceptable filename. We try to make sure we create unique
-    names for sockets, names that are not shared by multiple
-    guests, and we try to make them reasonably short.
-    """
-
-    # We're using hashing function which should, in theory, be prone to
-    # conflicts enough for us to never hit a collision. However, we cannot
-    # rule out the chance of getting same hash for different guests, and
-    # letting one socket serve two different guests is extremely hard to
-    # debug.
-    #
-    # Therefore we try to avoid the collision by not using the
-    # full size of the hash, just its substring - if we really reach the
-    # point where more than one guest yields the same hash, the first
-    # would use N starting characters for its socket, the second would
-    # use N+1 starting characters, and so on.
-    #
-    # For each potential socket path, a "reservation" file is used as
-    # a placeholder: once atomically created, no other guest can grab
-    # the given socket path.
-    for i in range(SSH_MASTER_SOCKET_MIN_HASH_LENGTH, SSH_MASTER_SOCKET_MAX_HASH_LENGTH):
-        digest = hashlib \
-            .sha256(guest_id.encode()) \
-            .hexdigest()[:i]
-
-        socket_path = socket_dir / f'{digest}.socket'
-        socket_reservation_path = f'{socket_path}.reservation'
-
-        logger.debug(
-            f"Possible SSH master socket path '{socket_path}' (hash method).",
-            level=4)
-
-        if limit_size and len(str(socket_path)) >= SSH_MASTER_SOCKET_LENGTH_LIMIT:
-            return None
-
-        # O_CREAT | O_EXCL means "atomic create-and-fail-if-exists".
-        # It's pretty much what `tempfile` does, but we need to control
-        # the full name, not just a prefix or suffix.
-        try:
-            fd = os.open(socket_reservation_path, flags=os.O_CREAT | os.O_EXCL)
-
-        except FileExistsError:
-            logger.debug(f"Proposed SSH socket '{socket_path}' already reserved.", level=4)
-            continue
-
-        # Successfully reserved the socket path, we can close the
-        # reservation file & return the actual path.
-        os.close(fd)
-
-        return socket_path
-
-    return None
-
-
 # Default rsync options
 DEFAULT_RSYNC_OPTIONS = [
     "-s", "-R", "-r", "-z", "--links", "--safe-links", "--delete"]
@@ -257,17 +86,6 @@ DEFAULT_REBOOT_COMMAND = Command('reboot')
 STAT_BTIME_PATTERN = re.compile(r'btime\s+(\d+)')
 
 
-# Note: returns a static list, but we cannot make it a mere list,
-# because `tmt.base` needs to be imported and that creates a circular
-# import loop.
-def essential_ansible_requires() -> list['tmt.base.Dependency']:
-    """ Return essential requirements for running Ansible modules """
-
-    return [
-        tmt.base.DependencySimple('/usr/bin/python3')
-        ]
-
-
 def format_guest_full_name(name: str, role: Optional[str]) -> str:
     """ Render guest's full name, i.e. name and its role """
 
@@ -280,6 +98,13 @@ def format_guest_full_name(name: str, role: Optional[str]) -> str:
 class CheckRsyncOutcome(enum.Enum):
     ALREADY_INSTALLED = 'already-installed'
     INSTALLED = 'installed'
+
+
+class GuestPackageManager(enum.Enum):
+    DNF = 'dnf'
+    DNF5 = 'dnf5'
+    YUM = 'yum'
+    RPM_OSTREE = 'rpm-ostree'
 
 
 T = TypeVar('T')
@@ -311,14 +136,15 @@ class GuestFacts(SerializableContainer):
     arch: Optional[str] = None
     distro: Optional[str] = None
     kernel_release: Optional[str] = None
-    package_manager: Optional['tmt.package_managers.GuestPackageManager'] = field(
+    package_manager: Optional[GuestPackageManager] = field(
         # cast: since the default is None, mypy cannot infere the full type,
         # and reports `package_manager` parameter to be `object`.
-        default=cast(Optional['tmt.package_managers.GuestPackageManager'], None))
+        default=cast(Optional[GuestPackageManager], None),
+        serialize=lambda package_manager: package_manager.value if package_manager else None,
+        unserialize=lambda raw_value: GuestPackageManager(raw_value) if raw_value else None)
 
     has_selinux: Optional[bool] = None
     is_superuser: Optional[bool] = None
-    is_ostree: Optional[bool] = None
 
     #: Various Linux capabilities and whether they are permitted to
     #: commands executed on this guest.
@@ -369,10 +195,6 @@ class GuestFacts(SerializableContainer):
         except tmt.utils.RunError as exc:
             if exc.stdout and 'Please login as the user' in exc.stdout:
                 raise tmt.utils.GeneralError(f'Login to the guest failed.\n{exc.stdout}') from exc
-            if exc.stderr and \
-                    f'executable file `{tmt.utils.DEFAULT_SHELL}` not found' in exc.stderr:
-                raise tmt.utils.GeneralError(
-                    f'{tmt.utils.DEFAULT_SHELL.capitalize()} is required on the guest.') from exc
 
         return None
 
@@ -439,7 +261,7 @@ class GuestFacts(SerializableContainer):
             guest: 'Guest',
             probes: list[tuple[Command, T]]) -> Optional[T]:
         """
-        Find a first successful command.
+        Find a first successfull command.
 
         :param guest: the guest to run commands on.
         :param probes: list of command/mark pairs.
@@ -459,7 +281,7 @@ class GuestFacts(SerializableContainer):
             guest: 'Guest',
             probes: list[tuple[Command, str]]) -> Optional[str]:
         """
-        Find a first successful command, and extract info from its output.
+        Find a first successfull command, and extract info from its output.
 
         :param guest: the guest to run commands on.
         :param probes: list of command/pattenr pairs.
@@ -516,37 +338,20 @@ class GuestFacts(SerializableContainer):
                 (Command('uname', '-r'), r'(.+)')
                 ])
 
-    def _query_package_manager(
-            self,
-            guest: 'Guest') -> Optional['tmt.package_managers.GuestPackageManager']:
-        # Discover as many package managers as possible: sometimes, the
-        # first discovered package manager is not the only or the best
-        # one available. Collect them, and sort them by their priorities
-        # to find the most suitable one.
-
-        discovered_package_managers: list[PackageManagerClass] = []
-
-        for _, package_manager_class \
-                in tmt.package_managers._PACKAGE_MANAGER_PLUGIN_REGISTRY.items():
-            if self._execute(guest, package_manager_class.probe_command):
-                discovered_package_managers.append(package_manager_class)
-
-        discovered_package_managers.sort(key=lambda pm: pm.probe_priority, reverse=True)
-
-        if discovered_package_managers:
-            guest.debug(
-                'Discovered package managers',
-                fmf.utils.listed([pm.NAME for pm in discovered_package_managers]),
-                level=4)
-
-            return discovered_package_managers[0].NAME
-
-        return None
+    def _query_package_manager(self, guest: 'Guest') -> Optional[GuestPackageManager]:
+        return self._probe(
+            guest,
+            [
+                (Command('stat', '/run/ostree-booted'), GuestPackageManager.RPM_OSTREE),
+                (Command('dnf5', '--version'), GuestPackageManager.DNF5),
+                (Command('dnf', '--version'), GuestPackageManager.DNF),
+                (Command('yum', '--version'), GuestPackageManager.YUM),
+                # And, one day, we'd follow up on this with...
+                # (Command('dpkg', '-l', 'apt'), 'apt')
+                ])
 
     def _query_has_selinux(self, guest: 'Guest') -> Optional[bool]:
         """
-        Detect whether guest uses SELinux.
-
         For detection ``/proc/filesystems`` is used, see ``man 5 filesystems`` for details.
         """
 
@@ -564,20 +369,6 @@ class GuestFacts(SerializableContainer):
             return None
 
         return output.stdout.strip() == 'root'
-
-    def _query_is_ostree(self, guest: 'Guest') -> Optional[bool]:
-        # https://github.com/vrothberg/chkconfig/commit/538dc7edf0da387169d83599fe0774ea080b4a37#diff-562b9b19cb1cd12a7343ce5c739745ebc8f363a195276ca58e926f22927238a5R1334
-        output = self._execute(
-            guest,
-            Command(
-                tmt.utils.DEFAULT_SHELL,
-                '-c',
-                'if [ -e /run/ostree-booted ] || [ -L /ostree ]; then echo yes; else echo no; fi'))
-
-        if output is None or output.stdout is None:
-            return None
-
-        return output.stdout.strip() == 'yes'
 
     def _query_capabilities(self, guest: 'Guest') -> dict[GuestCapability, bool]:
         # TODO: there must be a canonical way of getting permitted capabilities.
@@ -599,7 +390,6 @@ class GuestFacts(SerializableContainer):
         self.package_manager = self._query_package_manager(guest)
         self.has_selinux = self._query_has_selinux(guest)
         self.is_superuser = self._query_is_superuser(guest)
-        self.is_ostree = self._query_is_ostree(guest)
         self.capabilities = self._query_capabilities(guest)
 
         self.in_sync = True
@@ -617,7 +407,7 @@ class GuestFacts(SerializableContainer):
         yield 'kernel_release', 'kernel', self.kernel_release or 'unknown'
         yield 'package_manager', \
             'package manager', \
-            self.package_manager if self.package_manager else 'unknown'
+            self.package_manager.value if self.package_manager else 'unknown'
         yield 'has_selinux', 'selinux', 'yes' if self.has_selinux else 'no'
         yield 'is_superuser', 'is superuser', 'yes' if self.is_superuser else 'no'
 
@@ -647,90 +437,25 @@ def normalize_hardware(
 
     # From command line
     if isinstance(raw_hardware, (list, tuple)):
-        merged: dict[str, Any] = {}
+        merged: collections.defaultdict[str, Any] = collections.defaultdict(dict)
 
         for raw_datum in raw_hardware:
             components = tmt.hardware.ConstraintComponents.from_spec(raw_datum)
 
-            if components.name not in tmt.hardware.CHILDLESS_CONSTRAINTS \
-                    and components.child_name is None:
-                raise tmt.utils.SpecificationError(
-                    f"Hardware requirement '{raw_datum}' lacks "
-                    f"child property ({components.name}[N].M).")
-
-            if components.name in tmt.hardware.INDEXABLE_CONSTRAINTS \
-                    and components.peer_index is None:
-                raise tmt.utils.SpecificationError(
-                    f"Hardware requirement '{raw_datum}' lacks "
-                    f"entry index ({components.name}[N]).")
-
-            if components.peer_index is not None:
-                # This should not happen, the test above already ruled
-                # out `child_name` being `None`, but mypy does not know
-                # everything is fine.
-                assert components.child_name is not None  # narrow type
-
-                if components.name not in merged:
-                    merged[components.name] = []
-
-                # Calculate the number of placeholders needed.
-                placeholders = components.peer_index - len(merged[components.name]) + 1
-
-                # Fill in empty spots between the existing ones and the
-                # one we're adding with placeholders.
-                if placeholders > 0:
-                    merged[components.name].extend([{} for _ in range(placeholders)])
-
-                merged[components.name][components.peer_index][components.child_name] = \
-                    f'{components.operator} {components.value}'
-
-            elif components.name == 'cpu' and components.child_name == 'flag':
-                if components.name not in merged:
-                    merged[components.name] = {}
-
+            if components.name == 'cpu' and components.child_name == 'flag':
                 if 'flag' not in merged['cpu']:
                     merged['cpu']['flag'] = []
 
                 merged['cpu']['flag'].append(f'{components.operator} {components.value}')
 
             elif components.child_name:
-                if components.name not in merged:
-                    merged[components.name] = {}
-
                 merged[components.name][components.child_name] = \
                     f'{components.operator} {components.value}'
 
             else:
                 merged[components.name] = f'{components.operator} {components.value}'
 
-        # Very crude, we will need something better to handle `and` and
-        # `or` and nesting.
-        def _drop_placeholders(data: dict[str, Any]) -> dict[str, Any]:
-            new_data: dict[str, Any] = {}
-
-            for key, value in data.items():
-                if isinstance(value, list):
-                    new_data[key] = []
-
-                    for item in value:
-                        if isinstance(item, dict) and not item:
-                            continue
-
-                        new_data[key].append(item)
-
-                else:
-                    new_data[key] = value
-
-            return new_data
-
-        # TODO: if the index matters - and it does, because `disk[0]` is
-        # often a "root disk" - we need sparse list. Cannot prune
-        # placeholders now, because it would turn `disk[1]` into `disk[0]`,
-        # overriding whatever was set for the root disk.
-        # https://github.com/teemtee/tmt/issues/3004 for tracking.
-        # merged = _drop_placeholders(merged)
-
-        return tmt.hardware.Hardware.from_spec(merged)
+        return tmt.hardware.Hardware.from_spec(dict(merged))
 
     # From fmf
     return tmt.hardware.Hardware.from_spec(raw_hardware)
@@ -862,9 +587,6 @@ class GuestData(SerializableContainer):
             if isinstance(value, (list, tuple)):
                 printable_value = fmf.utils.listed(value)
 
-            elif isinstance(value, dict):
-                printable_value = tmt.utils.format_value(value)
-
             elif isinstance(value, tmt.hardware.Hardware):
                 printable_value = tmt.utils.dict_to_yaml(value.to_spec())
 
@@ -936,7 +658,7 @@ class Guest(tmt.utils.Common):
         # Append at least 5 random characters
         min_random_part = max(5, length - len(prefix))
         name = prefix + ''.join(
-            secrets.choice(string.ascii_letters) for _ in range(min_random_part))
+            random.choices(string.ascii_letters, k=min_random_part))
         # Return tail (containing random characters) of name
         return name[-length:]
 
@@ -950,7 +672,7 @@ class Guest(tmt.utils.Common):
         run_id = parent.plan.my_run.workdir.name
         return self._random_name(prefix=f"tmt-{run_id[-3:]}-")
 
-    @functools.cached_property
+    @cached_property
     def multihost_name(self) -> str:
         """ Return guest's multihost name, i.e. name and its role """
 
@@ -961,26 +683,6 @@ class Guest(tmt.utils.Common):
         """ Detect guest is ready or not """
 
         raise NotImplementedError
-
-    @functools.cached_property
-    def package_manager(self) -> 'tmt.package_managers.PackageManager':
-        if not self.facts.package_manager:
-            raise tmt.utils.GeneralError(
-                f"Package manager was not detected on guest '{self.name}'.")
-
-        return tmt.package_managers.find_package_manager(
-            self.facts.package_manager)(guest=self, logger=self._logger)
-
-    @functools.cached_property
-    def scripts_path(self) -> Path:
-        """ Absolute path to tmt scripts directory """
-
-        import tmt.steps.execute
-
-        # For rpm-ostree based distributions use a different default destination directory
-        return tmt.steps.execute.effective_scripts_dest_dir(
-            default=tmt.steps.execute.DEFAULT_SCRIPTS_DEST_DIR_OSTREE
-            if self.facts.is_ostree else tmt.steps.execute.DEFAULT_SCRIPTS_DEST_DIR)
 
     @classmethod
     def options(cls, how: Optional[str] = None) -> list[tmt.options.ClickOptionDecoratorType]:
@@ -1115,62 +817,42 @@ class Guest(tmt.utils.Common):
             return
         keys = 'ok changed unreachable failed skipped rescued ignored'.split()
         for key in keys:
-            matched = re.search(rf'^.*\s:\s.*{key}=(\d+).*$', output, re.MULTILINE)
+            matched = re.search(rf'^.*\s:\s.*{key}=(\d+).*$', output, re.M)
             if matched and int(matched.group(1)) > 0:
                 tasks = fmf.utils.listed(matched.group(1), 'task')
                 self.verbose(key, tasks, 'green')
 
-    def _sanitize_ansible_playbook_path(
-            self,
-            playbook: Path,
-            playbook_root: Optional[Path]) -> Path:
-        """
-        Prepare full ansible playbook path.
-
-        :param playbook: path to the playbook to run.
-        :param playbook_root: if set, ``playbook`` path must be located
-            under the given root path.
-        :returns: an absolute path to a playbook.
-        :raises GeneralError: when ``playbook_root`` is set, but
-            ``playbook`` is not located in this filesystem tree, or when
-            the eventual playbook path is not absolute.
-        """
-
-        # Some playbooks must be under playbook root, which is often
-        # a metadata tree root.
-        if playbook_root is not None:
-            playbook = playbook_root / playbook.unrooted()
-
-            if not playbook.is_relative_to(playbook_root):
-                raise tmt.utils.GeneralError(
-                    f"'{playbook}' is not relative to the expected root '{playbook_root}'.")
-
-        if not playbook.exists():
-            raise tmt.utils.FileError(f"Playbook '{playbook}' does not exist.")
-
+    def _ansible_playbook_path(self, playbook: Path) -> Path:
+        """ Prepare full ansible playbook path """
+        self.debug(f"Applying playbook '{playbook}' on guest '{self.primary_address}'.")
+        # FIXME: cast() - https://github.com/teemtee/tmt/issues/1372
+        parent = cast(Provision, self.parent)
+        assert parent.plan.my_run is not None  # narrow type
+        assert parent.plan.my_run.tree is not None  # narrow type
+        assert parent.plan.my_run.tree.root is not None  # narrow type
+        # Playbook paths should be relative to the metadata tree root
+        playbook = parent.plan.my_run.tree.root / playbook.unrooted()
         self.debug(f"Playbook full path: '{playbook}'", level=2)
-
         return playbook
 
     def _prepare_environment(
         self,
-        execute_environment: Optional[tmt.utils.Environment] = None
-            ) -> tmt.utils.Environment:
+        execute_environment: Optional[tmt.utils.EnvironmentType] = None
+            ) -> tmt.utils.EnvironmentType:
         """ Prepare dict of environment variables """
         # Prepare environment variables so they can be correctly passed
         # to shell. Create a copy to prevent modifying source.
-        environment = tmt.utils.Environment()
+        environment: tmt.utils.EnvironmentType = {}
         environment.update(execute_environment or {})
         # Plan environment and variables provided on the command line
         # override environment provided to execute().
         # FIXME: cast() - https://github.com/teemtee/tmt/issues/1372
-        if self.parent:
-            parent = cast(Provision, self.parent)
-            environment.update(parent.plan.environment)
+        parent = cast(Provision, self.parent)
+        environment.update(parent.plan.environment)
         return environment
 
     @staticmethod
-    def _export_environment(environment: tmt.utils.Environment) -> list[ShellScript]:
+    def _export_environment(environment: tmt.utils.EnvironmentType) -> list[ShellScript]:
         """ Prepare shell export of environment variables """
         if not environment:
             return []
@@ -1185,7 +867,7 @@ class Guest(tmt.utils.Common):
             friendly_command: Optional[str] = None,
             silent: bool = False,
             cwd: Optional[Path] = None,
-            env: Optional[tmt.utils.Environment] = None,
+            env: Optional[tmt.utils.EnvironmentType] = None,
             interactive: bool = False,
             log: Optional[tmt.log.LoggingFunction] = None,
             **kwargs: Any) -> tmt.utils.CommandOutput:
@@ -1230,7 +912,6 @@ class Guest(tmt.utils.Common):
     def _run_ansible(
             self,
             playbook: Path,
-            playbook_root: Optional[Path] = None,
             extra_args: Optional[str] = None,
             friendly_command: Optional[str] = None,
             log: Optional[tmt.log.LoggingFunction] = None,
@@ -1242,9 +923,7 @@ class Guest(tmt.utils.Common):
         playbook in whatever way is fitting for the guest and infrastructure.
 
         :param playbook: path to the playbook to run.
-        :param playbook_root: if set, ``playbook`` path must be located
-            under the given root path.
-        :param extra_args: additional arguments to be passed to ``ansible-playbook``
+        :param extra_args: aditional arguments to be passed to ``ansible-playbook``
             via ``--extra-args``.
         :param friendly_command: if set, it would be logged instead of the
             command itself, to improve visibility of the command in logging output.
@@ -1259,7 +938,6 @@ class Guest(tmt.utils.Common):
     def ansible(
             self,
             playbook: Path,
-            playbook_root: Optional[Path] = None,
             extra_args: Optional[str] = None,
             friendly_command: Optional[str] = None,
             log: Optional[tmt.log.LoggingFunction] = None,
@@ -1267,13 +945,11 @@ class Guest(tmt.utils.Common):
         """
         Run an Ansible playbook on the guest.
 
-        A wrapper for :py:meth:`_run_ansible` which is responsible for running
+        A wrapper for :py:meth:`_run_ansible` which is reponsible for running
         the playbook while this method makes sure our logging is consistent.
 
         :param playbook: path to the playbook to run.
-        :param playbook_root: if set, ``playbook`` path must be located
-            under the given root path.
-        :param extra_args: additional arguments to be passed to ``ansible-playbook``
+        :param extra_args: aditional arguments to be passed to ``ansible-playbook``
             via ``--extra-args``.
         :param friendly_command: if set, it would be logged instead of the
             command itself, to improve visibility of the command in logging output.
@@ -1285,7 +961,6 @@ class Guest(tmt.utils.Common):
 
         output = self._run_ansible(
             playbook,
-            playbook_root=playbook_root,
             extra_args=extra_args,
             friendly_command=friendly_command,
             log=log if log else self._command_verbose_logger,
@@ -1297,7 +972,7 @@ class Guest(tmt.utils.Common):
     def execute(self,
                 command: tmt.utils.ShellScript,
                 cwd: Optional[Path] = None,
-                env: Optional[tmt.utils.Environment] = None,
+                env: Optional[tmt.utils.EnvironmentType] = None,
                 friendly_command: Optional[str] = None,
                 test_session: bool = False,
                 tty: bool = False,
@@ -1312,7 +987,7 @@ class Guest(tmt.utils.Common):
     def execute(self,
                 command: tmt.utils.Command,
                 cwd: Optional[Path] = None,
-                env: Optional[tmt.utils.Environment] = None,
+                env: Optional[tmt.utils.EnvironmentType] = None,
                 friendly_command: Optional[str] = None,
                 test_session: bool = False,
                 tty: bool = False,
@@ -1326,7 +1001,7 @@ class Guest(tmt.utils.Common):
     def execute(self,
                 command: Union[tmt.utils.Command, tmt.utils.ShellScript],
                 cwd: Optional[Path] = None,
-                env: Optional[tmt.utils.Environment] = None,
+                env: Optional[tmt.utils.EnvironmentType] = None,
                 friendly_command: Optional[str] = None,
                 test_session: bool = False,
                 tty: bool = False,
@@ -1351,7 +1026,9 @@ class Guest(tmt.utils.Common):
              destination: Optional[Path] = None,
              options: Optional[list[str]] = None,
              superuser: bool = False) -> None:
-        """ Push files to the guest """
+        """
+        Push files to the guest
+        """
 
         raise NotImplementedError
 
@@ -1360,7 +1037,9 @@ class Guest(tmt.utils.Common):
              destination: Optional[Path] = None,
              options: Optional[list[str]] = None,
              extend_options: Optional[list[str]] = None) -> None:
-        """ Pull files from the guest """
+        """
+        Pull files from the guest
+        """
 
         raise NotImplementedError
 
@@ -1460,7 +1139,28 @@ class Guest(tmt.utils.Common):
         except tmt.utils.RunError:
             pass
 
-        self.package_manager.install(Package('rsync'))
+        # Check the package manager
+        self.debug("Check the package manager.")
+        try:
+            self.execute(Command('dnf', '--version'))
+            package_manager = "dnf"
+        except tmt.utils.RunError:
+            package_manager = "yum"
+
+        # Install under '/root/pkg' for read-only distros
+        # (for now the check is based on 'rpm-ostree' presence)
+        # FIXME: Find a better way how to detect read-only distros
+        self.debug("Check for a read-only distro.")
+        try:
+            self.execute(Command('rpm-ostree', '--version'))
+            readonly = (
+                " --installroot=/root/pkg --releasever / "
+                "&& ln -sf /root/pkg/bin/rsync /usr/local/bin/rsync")
+        except tmt.utils.RunError:
+            readonly = ""
+
+        # Install the rsync
+        self.execute(ShellScript(f"{package_manager} install -y rsync" + readonly))
 
         return CheckRsyncOutcome.INSTALLED
 
@@ -1548,141 +1248,34 @@ class GuestSsh(Guest):
     ssh_option: list[str]
 
     # Master ssh connection process and socket path
-    _ssh_master_process_lock: threading.Lock
     _ssh_master_process: Optional['subprocess.Popen[bytes]'] = None
+    _ssh_socket_path: Optional[Path] = None
 
-    def __init__(self,
-                 *,
-                 data: GuestData,
-                 name: Optional[str] = None,
-                 parent: Optional[tmt.utils.Common] = None,
-                 logger: tmt.log.Logger) -> None:
-        self._ssh_master_process_lock = threading.Lock()
-
-        super().__init__(data=data, logger=logger, parent=parent, name=name)
-
-    @functools.cached_property
     def _ssh_guest(self) -> str:
         """ Return user@guest """
         return f'{self.user}@{self.primary_address}'
 
-    @functools.cached_property
-    def _is_ssh_master_socket_path_acceptable(self) -> bool:
-        """ Whether the SSH master socket path we create is acceptable by SSH """
+    def _ssh_socket(self) -> Path:
+        """ Prepare path to the master connection socket """
+        if not self._ssh_socket_path:
+            # Use '/run/user/uid' if it exists, '/tmp' otherwise
+            run_dir = Path(f"/run/user/{os.getuid()}")
+            socket_dir = run_dir / "tmt" if run_dir.is_dir() else Path("/tmp")
+            socket_dir.mkdir(exist_ok=True)
+            self._ssh_socket_path = Path(tempfile.mktemp(dir=socket_dir))
+        return self._ssh_socket_path
 
-        if len(str(self._ssh_master_socket_path)) >= SSH_MASTER_SOCKET_LENGTH_LIMIT:
-            self.warn("SSH multiplexing will not be used because the SSH master socket path "
-                      f"'{self._ssh_master_socket_path}' is too long.")
-            return False
-
-        return True
-
-    @property
-    def is_ssh_multiplexing_enabled(self) -> bool:
-        """ Whether SSH multiplexing should be used """
-
-        if self.primary_address is None:
-            return False
-
-        if not self._is_ssh_master_socket_path_acceptable:
-            return False
-
-        return True
-
-    @functools.cached_property
-    def _ssh_master_socket_path(self) -> Path:
-        """ Return path to the SSH master socket """
-
-        # Can be any step opening the connection
-        assert isinstance(self.parent, tmt.steps.Step)
-        assert self.parent.plan.my_run is not None
-        assert self.parent.plan.my_run.workdir is not None
-
-        socket_dir = self.parent.plan.my_run.workdir / 'ssh-sockets'
-
-        try:
-            socket_dir.mkdir(parents=True, exist_ok=True)
-
-        except Exception as exc:
-            raise ProvisionError(f"Failed to create SSH socket directory '{socket_dir}'.") from exc
-
-        # Try more informative, but possibly too long path, constructed
-        # from pieces humans can easily understand and follow.
-        #
-        # The template is what seems to be a common template in general
-        # SSH discussions, hostname, port, username. Can we use guest
-        # name? Maybe, on the other hand, guest name is meaningless
-        # outside of its plan, it might be too ambiguous. Starting with
-        # what SSH folk uses, we may amend it later.
-
-        # This should be true, otherwise `is_ssh_multiplexing_enabled` would return `False`
-        # and nobody would need to use SSH master socket path.
-        assert self.primary_address
-
-        guest_id_components: list[str] = [self.primary_address]
-
-        if self.port:
-            guest_id_components.append(str(self.port))
-
-        if self.user:
-            guest_id_components.append(self.user)
-
-        guest_id = '-'.join(guest_id_components)
-
-        socket_path = _socket_path_trivial(
-            socket_dir=socket_dir,
-            guest_id=guest_id,
-            logger=self._logger)
-
-        if socket_path is not None:
-            self.debug(
-                f"SSH master socket path will be '{socket_path}' (trivial method).",
-                level=4)
-
-            return socket_path
-
-        # The readable name was too long. Try different approach: use
-        # a hash of the pieces, and use just a substring of the hash,
-        # not all 64 or whatever characters. If the substring is already
-        # in use - extremely unlikely, yet possible - try a slightly
-        # longer one.
-        socket_path = _socket_path_hash(
-            socket_dir=socket_dir,
-            guest_id=guest_id,
-            logger=self._logger)
-
-        if socket_path is not None:
-            self.debug(
-                f"SSH master socket path will be '{socket_path}' (hash method).",
-                level=4)
-
-            return socket_path
-
-        # Not even the hashing function and short substrings helped.
-        # Return the most readable one, and let caller decide whether
-        # they use it or not. We run out of options.
-        socket_path = _socket_path_trivial(
-            socket_dir=socket_dir,
-            guest_id=guest_id,
-            limit_size=False,
-            logger=self._logger)
-
-        self.debug(
-            f"SSH master socket path will be '{socket_path}' (trivial method, no size limit).",
-            level=4)
-
-        return socket_path
-
-    @functools.cached_property
-    def _ssh_master_socket_reservation_path(self) -> Path:
-        return Path(f'{self._ssh_master_socket_path}.reservation')
-
-    @property
     def _ssh_options(self) -> Command:
-        """ Return common SSH options """
-
-        options = BASE_SSH_OPTIONS[:]
-
+        """ Return common ssh options (list or joined) """
+        options: tmt.utils.RawCommand = [
+            '-oForwardX11=no',
+            '-oStrictHostKeyChecking=no',
+            '-oUserKnownHostsFile=/dev/null',
+            # Prevent ssh from disconnecting if no data has been
+            # received from the server for a long time (#868).
+            '-oServerAliveInterval=60',
+            '-oServerAliveCountMax=5',
+            ]
         if self.key or self.password:
             # Skip ssh-agent (it adds additional identities)
             options.append('-oIdentitiesOnly=yes')
@@ -1693,122 +1286,43 @@ class GuestSsh(Guest):
                 options.extend(['-i', key])
         if self.password:
             options.extend(['-oPasswordAuthentication=yes'])
-        else:
-            # Make sure the connection is rejected when we want key-
-            # based authentication only instead of presenting a prompt.
-            # Prevents issues like https://github.com/teemtee/tmt/issues/2687
-            # from happening and makes the ssh connection more robust
-            # by allowing proper re-try mechanisms to kick-in.
-            options.extend(['-oPasswordAuthentication=no'])
 
-        # Include the SSH master process
-        if self.is_ssh_multiplexing_enabled:
-            options.append(f'-S{self._ssh_master_socket_path}')
+        # Use the shared master connection
+        options.append(f'-S{self._ssh_socket()}')
 
         options.extend([f'-o{option}' for option in self.ssh_option])
 
         return Command(*options)
 
-    @property
-    def _base_ssh_command(self) -> Command:
-        """ A base SSH command shared by all SSH processes """
+    def _ssh_master_connection(self, command: Command) -> None:
+        """ Check/create the master ssh connection """
+        if self._ssh_master_process:
+            return
 
-        command = Command(
-            *(["sshpass", "-p", self.password] if self.password else []),
-            "ssh"
-            )
-
-        return command + self._ssh_options
-
-    def _spawn_ssh_master_process(self) -> subprocess.Popen[bytes]:
-        """ Spawn the SSH master process """
-
-        # NOTE: do not modify `command`, it might be re-used by the caller. To
-        # be safe, include it in our own command.
-        ssh_master_command = self._base_ssh_command \
-            + self._ssh_options \
-            + Command("-MNnT", self._ssh_guest)
-
-        self.debug(f"Spawning the SSH master process: {ssh_master_command}")
-
-        return subprocess.Popen(
+        # Do not modify the original command...
+        ssh_master_command = command + self._ssh_options() + Command("-MNnT", self._ssh_guest())
+        self.debug(f"Create the master ssh connection: {ssh_master_command}")
+        self._ssh_master_process = subprocess.Popen(
             ssh_master_command.to_popen(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
 
-    def _cleanup_ssh_master_process(
-            self,
-            signal: _signal.Signals = _signal.SIGTERM,
-            logger: Optional[tmt.log.Logger] = None) -> None:
-        logger = logger or self._logger
-
-        if not self.is_ssh_multiplexing_enabled:
-            logger.debug('The SSH master process cannot be terminated because it is disabled.',
-                         level=3)
-
-            return
-
-        with self._ssh_master_process_lock:
-            if self._ssh_master_process is None:
-                logger.debug('The SSH master process cannot be terminated because it is unset.',
-                             level=3)
-
-                return
-
-            logger.debug(
-                f'Terminating the SSH master process {self._ssh_master_process.pid}'
-                f' with {signal.name}.',
-                level=3)
-
-            self._ssh_master_process.send_signal(signal)
-
-            try:
-                # TODO: make the deadline configurable
-                self._ssh_master_process.wait(timeout=3)
-
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    f'Terminating the SSH master process {self._ssh_master_process.pid}'
-                    ' timed out.')
-
-            self._ssh_master_process = None
-
-    @property
     def _ssh_command(self) -> Command:
-        """ A base SSH command shared by all SSH processes """
+        """ Prepare an ssh command line for execution """
+        command = Command(
+            *(["sshpass", "-p", self.password] if self.password else []),
+            "ssh"
+            )
 
-        if self.is_ssh_multiplexing_enabled:
-            with self._ssh_master_process_lock:
-                if self._ssh_master_process is None:
-                    self._ssh_master_process = self._spawn_ssh_master_process()
+        # Check the master connection
+        self._ssh_master_connection(command)
 
-        return self._base_ssh_command
-
-    def _unlink_ssh_master_socket_path(self) -> None:
-        if not self.is_ssh_multiplexing_enabled:
-            return
-
-        with self._ssh_master_process_lock:
-            if not self._ssh_master_socket_path:
-                return
-
-            self.debug(f"Remove SSH master socket '{self._ssh_master_socket_path}'.", level=3)
-
-            try:
-                self._ssh_master_socket_path.unlink(missing_ok=True)
-                self._ssh_master_socket_reservation_path.unlink(missing_ok=True)
-
-            except OSError as error:
-                self.debug(f"Failed to remove the SSH master socket: {error}", level=3)
-
-            del self._ssh_master_socket_path
-            del self._ssh_master_socket_reservation_path
+        return command + self._ssh_options()
 
     def _run_ansible(
             self,
             playbook: Path,
-            playbook_root: Optional[Path] = None,
             extra_args: Optional[str] = None,
             friendly_command: Optional[str] = None,
             log: Optional[tmt.log.LoggingFunction] = None,
@@ -1820,9 +1334,7 @@ class GuestSsh(Guest):
         playbook in whatever way is fitting for the guest and infrastructure.
 
         :param playbook: path to the playbook to run.
-        :param playbook_root: if set, ``playbook`` path must be located
-            under the given root path.
-        :param extra_args: additional arguments to be passed to ``ansible-playbook``
+        :param extra_args: aditional arguments to be passed to ``ansible-playbook``
             via ``--extra-args``.
         :param friendly_command: if set, it would be logged instead of the
             command itself, to improve visibility of the command in logging output.
@@ -1831,8 +1343,7 @@ class GuestSsh(Guest):
         :param silent: if set, logging of steps taken by this function would be
             reduced.
         """
-
-        playbook = self._sanitize_ansible_playbook_path(playbook, playbook_root)
+        playbook = self._ansible_playbook_path(playbook)
 
         ansible_command = Command('ansible-playbook', *self._ansible_verbosity())
 
@@ -1840,8 +1351,8 @@ class GuestSsh(Guest):
             ansible_command += self._ansible_extra_args(extra_args)
 
         ansible_command += Command(
-            '--ssh-common-args', self._ssh_options.to_element(),
-            '-i', f'{self._ssh_guest},',
+            '--ssh-common-args', self._ssh_options().to_element(),
+            '-i', f'{self._ssh_guest()},',
             playbook)
 
         # FIXME: cast() - https://github.com/teemtee/tmt/issues/1372
@@ -1866,7 +1377,15 @@ class GuestSsh(Guest):
         if self.is_dry_run:
             return
         if not self.facts.is_superuser and self.become:
-            self.package_manager.install(FileSystemPath('/usr/bin/setfacl'))
+            assert self.facts.package_manager is not None
+            # TODO: refactor this after PR #2557 is completed
+            self.execute(
+                Command(
+                    'sudo',
+                    f'{self.facts.package_manager.value}',
+                    'install',
+                    '-y',
+                    'acl'))
             workdir_root = effective_workdir_root()
             self.execute(ShellScript(
                 f"""
@@ -1877,7 +1396,7 @@ class GuestSsh(Guest):
     def execute(self,
                 command: Union[tmt.utils.Command, tmt.utils.ShellScript],
                 cwd: Optional[Path] = None,
-                env: Optional[tmt.utils.Environment] = None,
+                env: Optional[tmt.utils.EnvironmentType] = None,
                 friendly_command: Optional[str] = None,
                 test_session: bool = False,
                 tty: bool = False,
@@ -1899,7 +1418,7 @@ class GuestSsh(Guest):
         if self.primary_address is None and not self.is_dry_run:
             raise tmt.utils.GeneralError('The guest is not available.')
 
-        ssh_command: tmt.utils.Command = self._ssh_command
+        ssh_command: tmt.utils.Command = self._ssh_command()
 
         # Run in interactive mode if requested
         if interactive:
@@ -1933,7 +1452,7 @@ class GuestSsh(Guest):
         remote_command = remote_commands.to_element()
 
         ssh_command += [
-            self._ssh_guest,
+            self._ssh_guest(),
             remote_command
             ]
 
@@ -1971,7 +1490,7 @@ class GuestSsh(Guest):
 
         By default the whole plan workdir is synced to the same location
         on the guest. Use the 'source' and 'destination' to sync custom
-        location and the 'options' parameter to modify default options
+        location and the 'options' parametr to modify default options
         which are '-Rrz --links --safe-links --delete'.
 
         Set 'superuser' if rsync command has to run as root or passwordless
@@ -2010,9 +1529,9 @@ class GuestSsh(Guest):
             self._run_guest_command(Command(
                 *cmd,
                 *options,
-                "-e", self._ssh_command.to_element(),
+                "-e", self._ssh_command().to_element(),
                 source,
-                f"{self._ssh_guest}:{destination}"
+                f"{self._ssh_guest()}:{destination}"
                 ), silent=True)
 
         # Try to push twice, check for rsync after the first failure
@@ -2075,8 +1594,8 @@ class GuestSsh(Guest):
             self._run_guest_command(Command(
                 "rsync",
                 *options,
-                "-e", self._ssh_command.to_element(),
-                f"{self._ssh_guest}:{source}",
+                "-e", self._ssh_command().to_element(),
+                f"{self._ssh_guest()}:{source}",
                 destination
                 ), silent=True)
 
@@ -2106,17 +1625,28 @@ class GuestSsh(Guest):
         """
 
         # Close the master ssh connection
-        self._cleanup_ssh_master_process()
+        if self._ssh_master_process:
+            self.debug("Close the master ssh connection.", level=3)
+            try:
+                self._ssh_master_process.terminate()
+                self._ssh_master_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
 
         # Remove the ssh socket
-        self._unlink_ssh_master_socket_path()
+        if self._ssh_socket_path and self._ssh_socket_path.exists():
+            self.debug(
+                f"Remove ssh socket '{self._ssh_socket_path}'.", level=3)
+            try:
+                self._ssh_socket_path.unlink()
+            except OSError as error:
+                self.debug(f"Failed to remove the socket: {error}", level=3)
 
     def perform_reboot(self,
                        command: Callable[[], tmt.utils.CommandOutput],
                        timeout: Optional[int] = None,
                        tick: float = tmt.utils.DEFAULT_WAIT_TICK,
-                       tick_increase: float = tmt.utils.DEFAULT_WAIT_TICK_INCREASE,
-                       hard: bool = False) -> bool:
+                       tick_increase: float = tmt.utils.DEFAULT_WAIT_TICK_INCREASE) -> bool:
         """
         Perform the actual reboot and wait for the guest to recover.
 
@@ -2143,7 +1673,7 @@ class GuestSsh(Guest):
 
             return int(match.group(1))
 
-        current_boot_time = 0 if hard else get_boot_time()
+        current_boot_time = get_boot_time()
 
         try:
             command()
@@ -2225,8 +1755,7 @@ class GuestSsh(Guest):
             lambda: self.execute(actual_command),
             timeout=timeout,
             tick=tick,
-            tick_increase=tick_increase,
-            hard=hard)
+            tick_increase=tick_increase)
 
     def remove(self) -> None:
         """
@@ -2236,6 +1765,47 @@ class GuestSsh(Guest):
         consume any disk resources.
         """
         self.debug(f"Doing nothing to remove guest '{self.primary_address}'.")
+
+    def _check_rsync(self) -> CheckRsyncOutcome:
+        """
+        Make sure that rsync is installed on the guest
+
+        On read-only distros install it under the '/root/pkg' directory.
+        Returns 'already installed' when rsync is already present.
+        """
+
+        # Check for rsync (nothing to do if already installed)
+        self.debug("Ensure that rsync is installed on the guest.")
+        try:
+            self.execute(Command('rsync', '--version'))
+            return CheckRsyncOutcome.ALREADY_INSTALLED
+        except tmt.utils.RunError:
+            pass
+
+        # Check the package manager
+        self.debug("Check the package manager.")
+        try:
+            self.execute(Command('dnf', '--version'))
+            package_manager = "dnf"
+        except tmt.utils.RunError:
+            package_manager = "yum"
+
+        # Install under '/root/pkg' for read-only distros
+        # (for now the check is based on 'rpm-ostree' presence)
+        # FIXME: Find a better way how to detect read-only distros
+        self.debug("Check for a read-only distro.")
+        try:
+            self.execute(Command('rpm-ostree', '--version'))
+            readonly = (
+                " --installroot=/root/pkg --releasever / "
+                "&& ln -sf /root/pkg/bin/rsync /usr/local/bin/rsync")
+        except tmt.utils.RunError:
+            readonly = ""
+
+        # Install the rsync
+        self.execute(ShellScript(f"{package_manager} install -y rsync" + readonly))
+
+        return CheckRsyncOutcome.INSTALLED
 
 
 @dataclasses.dataclass
@@ -2254,7 +1824,7 @@ class ProvisionStepData(tmt.steps.StepData):
 ProvisionStepDataT = TypeVar('ProvisionStepDataT', bound=ProvisionStepData)
 
 
-class ProvisionPlugin(tmt.steps.GuestlessPlugin[ProvisionStepDataT, None]):
+class ProvisionPlugin(tmt.steps.GuestlessPlugin[ProvisionStepDataT]):
     """ Common parent of provision plugins """
 
     # ignore[assignment]: as a base class, ProvisionStepData is not included in
@@ -2299,11 +1869,6 @@ class ProvisionPlugin(tmt.steps.GuestlessPlugin[ProvisionStepDataT, None]):
             Provision.store_cli_invocation(context)
 
         return provision
-
-    def go(self, *, logger: Optional[tmt.log.Logger] = None) -> None:
-        """ Perform actions shared among plugins when beginning their tasks """
-
-        self.go_prolog(logger or self._logger)
 
     # TODO: this might be needed until https://github.com/teemtee/tmt/issues/1696 is resolved
     def opt(self, option: str, default: Optional[Any] = None) -> Any:
@@ -2657,7 +2222,7 @@ class Provision(tmt.steps.Step):
                 tasks that failed.
             """
 
-            queue: PhaseQueue[ProvisionStepData, None] = PhaseQueue(
+            queue: PhaseQueue[ProvisionStepData] = PhaseQueue(
                 'provision.action',
                 self._logger.descend(logger_name=f'{self}.queue'))
 
@@ -2684,11 +2249,7 @@ class Provision(tmt.steps.Step):
         # the order or their `order` key. We will group provisioning phases
         # not interrupted by action into batches, and run the sequence of
         # provisioning phases in parallel.
-        all_phases = [
-            p
-            for p in self.phases(classes=(Action, ProvisionPlugin))
-            if isinstance(p, Action) or p.enabled_by_when
-            ]
+        all_phases = self.phases(classes=(Action, ProvisionPlugin))
         all_phases.sort(key=lambda x: x.order)
 
         all_outcomes: list[Union[ActionTask, ProvisionTask]] = []
